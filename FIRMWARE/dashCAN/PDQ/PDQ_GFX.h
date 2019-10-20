@@ -48,7 +48,7 @@ POSSIBILITY OF SUCH DAMAGE.
 // 2) Between ~2.5 and ~12 times faster (fillRect ~2.5x, drawLine ~12x).
 // An average of ~4x faster over entire "graphictest.ino" benchmark.
 //
-// Even if this library is faster, it was based on the Adafruit original. 
+// Even if this library is faster, it was based on the Adafruit original.
 // Adafruit deserves your support for making their library open-source (and
 // for having some nice LCD modules and all kinds of other great parts too).
 // Consider giving them your support if possible!
@@ -142,6 +142,7 @@ public:
 	static void drawBitmap(coord_t x, coord_t y, uint8_t *bitmap, coord_t w, coord_t h, color_t color);
 	static void drawBitmap(coord_t x, coord_t y, uint8_t *bitmap, coord_t w, coord_t h, color_t color, color_t bg);
 	static void drawXBitmap(coord_t x, coord_t y, const uint8_t *bitmap, coord_t w, coord_t h, color_t color);
+	static void drawYBitmap(coord_t x, coord_t y, uint8_t *bitmap, coord_t w, coord_t h, color_t color);
 	static void drawChar(coord_t x, coord_t y, unsigned char c, color_t color, color_t bg, uint8_t size);
 	static void drawCharGFX(coord_t x, coord_t y, unsigned char c, color_t color, color_t bg, uint8_t size);
 	static inline void setCursor(coord_t x, coord_t y);
@@ -710,6 +711,37 @@ void PDQ_GFX<HW>::drawXBitmap(coord_t x, coord_t y, const uint8_t *bitmap, coord
 
 			if (byte & 0x01)
 				HW::drawPixel(x+i, y+j, color);
+		}
+	}
+}
+
+template<class HW>
+void PDQ_GFX<HW>::drawYBitmap(coord_t x, coord_t y, uint8_t *bitmap, coord_t w, coord_t h, color_t color)
+{
+	coord_t i, j, byteWidth = (w + 7) / 8;
+	uint8_t byte;
+
+	char state = 0;
+	int x_start;
+
+	for (j = 0; j < h; j++)
+	{
+		for (i = 0; i < w; i++)
+		{
+			if (i % 8 == 0){
+				byte = bitmap[j * byteWidth + i / 8]; //byte = pgm_read_byte(bitmap + j * byteWidth + i / 8);
+			}else{
+				byte >>= 1; //byte >>= 1;
+			}
+
+			//HW::drawPixel(x+i, y+j, color);
+			if ((byte & 0x01) && !state){
+				state = 1;
+				x_start = i;
+			} else if ((!(byte & 0x01) && state) || ((i == w - 1) && (byte & 0x01))){
+				state = 0;
+				HW::drawFastHLine_(x_start, y + j, i + 1 - x_start, color);
+			}
 		}
 	}
 }

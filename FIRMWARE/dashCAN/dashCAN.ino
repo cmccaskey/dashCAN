@@ -1,10 +1,15 @@
-//avrdude -c usbtiny -p m328p -U lfuse:w:0b11110111:m
+//avrdude -c usbtiny -p m328p -U lfuse:w:0b11110111:m -U
+//avrdude -c usbtiny -p m328p -U efuse:w:0b00000111:m
 
 //#define GEAR_ONLY
 
 #include <SPI.h>
-#include <SD.h>
+#include <SdFat.h>
 #include "MCP/mcp_can.cpp"
+#include "PCINT/pcint.h"
+
+#include "PCINT/pcint.cpp"
+
 
 #include "PDQ/PDQ_GFX.h"        // PDQ: Core graphics library
 #include "PDQ/PDQ_ILI9341_config.h"     // PDQ: ILI9341 pins and other setup for this sketch
@@ -97,59 +102,153 @@ int lastRPM = -1; //used to detect if the data needs updated
 int lastGear = -1;
 int lastSpeed = -1;
 
-const int MPH_CLEAR[] = {10, 170, 100, 40};
-const int GEAR_CLEAR[] = {110, 170, 100, 40};
-const int PSI_CLEAR[] = {210, 170, 100, 40};
-const int THROTTLE_CLEAR[] = {10, 100, 100, 40};
-const int COOL_CLEAR[] = {110, 100, 100, 40};
-const int FUEL_CLEAR[] = {210, 100, 100, 40};
-const int GEAR_LARGE_CLEAR[] = {0, 0, 320, 240};
-
 const int MPH_DRAW[] = {10, 200};
 const int GEAR_DRAW[] = {110, 200};
 const int PSI_DRAW[] = {205, 200};
 const int THROTTLE_DRAW[] = {10, 130};
 const int COOL_DRAW[] = {110, 130};
+const int TIMING_DRAW[] = {110, 50};
 const int FUEL_DRAW[] = {210, 130};
 const int GEAR_LARGE_BLUE_DRAW[] = {100, 70};
 const int GEAR_LARGE_GREEN_DRAW[] = {100, 70};
 const int GEAR_LARGE_YELLOW_DRAW[] = {100, 70};
 const int GEAR_LARGE_RED_DRAW[] = {100, 70};
 
+File imageFile;
 File dataFile;
+File configFile;
+
+SdFat SD;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#define BUTTON 4
+
+#define HEIGHT 40
+
+char logFileName[] = "L_01.CSV";
+
+uint8_t bufferTemp[HEIGHT];
+
 void setup(void) {
-  delay(1000);
   digitalWrite(ILI9341_LED_PIN, LOW);
   pinMode(ILI9341_LED_PIN, OUTPUT);
+
   Serial.begin(115200);
-  while (CAN_OK != CAN.begin(CAN_500KBPS)) {
+  Serial.println("Booting");
+  if (CAN_OK != CAN.begin(CAN_500KBPS)) {
     Serial.println("CAN FAIL");
-    delay(100);
   }
-  if (!SD.begin(SD_CS)) {
-    Serial.println("SD FAIL");
-    // don't do anything more:
-    //while (1);
+
+  SD.begin(SD_CS);
+  char configFileName[] = "CONFIG.CSV";
+  configFile = SD.open(configFileName, FILE_READ);
+
+  char configBuffer[3] = { -1, -1, -1};
+  int configBufferCounter = 0;
+  while (configFile.peek() != -1) {
+    char in = configFile.read();
+    if (in != ',' && in != '\n' && in != '\r') {
+      configBuffer[configBufferCounter] = in - 48; //ASCII to decimal
+      configBufferCounter ++;
+    } else {
+      int configBufferInt = 0;
+      if (configBuffer[1] == -1) {
+        configBufferInt = configBuffer[0];
+      } else if (configBuffer[1] == -1) {
+        configBufferInt = configBuffer[0] * 10 + configBuffer[1];
+      } else {
+        configBufferInt = configBuffer[0] * 100 + configBuffer[1] * 10 + configBuffer[2];
+      }
+      Serial.print("configBufferInt: ");
+      Serial.println(configBufferInt);
+      configBufferCounter = 0;
+      for (int i = 0; i < 3; i ++) {
+        configBuffer[i] = -1;
+      }
+    }
   }
-  for (uint8_t i = 0; i < 255; i ++) {
-    if (!SD.exists(i + ".csv")) {
-      dataFile = SD.open(i + ".csv");
+
+
+  for (uint8_t i = 1; i < 99; i ++) {
+    if (i <= 9) {
+      logFileName[3] = i + 48;
+    } else if (i <= 99) {
+      logFileName[3] = i % 10 + 48;
+      logFileName[2] = i / 10 + 48;
+    }
+
+    if (!SD.exists(logFileName)) {
+      Serial.print("Logging to: ");
+      Serial.println(logFileName);
       break;
     }
   }
-  Serial.println("GOOD");
+  dataFile = SD.open(logFileName, FILE_WRITE);
+  dataFile.println("millis(),psi,rpm,mph,coolantTemp,throttle,fuelLevel,gear");
+  dataFile.flush();
   pinMode(MCP_INT, INPUT_PULLUP);
   set_mask_filt();
+
   initTFT();
+  drawImage("Mask.xbml", ILI9341_BLACK);
+  drawImage("Loading.xbml", ILI9341_RED);
   initTFTDraw();
-  //clearData(GEAR_LARGE_CLEAR);
-  //drawDataLarge(GEAR_LARGE_BLUE_DRAW, 0, 0);
-  //drawSweep();
-  //drawLabels();
-  dataFile.println("millis(),psi,rpm,mph,coolantTemp,throttle,fuelLevel,gear");
+  //dataFile.close();
+  delay(1000);
+  drawImage("Mask.xbml", ILI9341_BLACK);
+  drawImage("Menu1.xbml", ILI9341_WHITE);
+}
+
+
+
+char SPCR_SD;
+
+void swapSPCR() {
+  char temp = SPCR;
+  SPCR = SPCR_SD;
+  SPCR_SD = temp;
+}
+
+
+void drawImage(String fileName, int color) {
+  //digitalWrite(ILI9341_LED_PIN, LOW); 
+  dataFile.close();
+  unsigned long totalTFT = 0;
+  unsigned long totalSDbegin = 0;
+  unsigned long totalSDread = 0;
+  SD.begin(SD_CS);
+  imageFile = SD.open(fileName, FILE_READ);
+  if (imageFile.available()) {
+    for (int j = 0; j < 9600 / HEIGHT; j ++) {
+      unsigned long totalSDbeginTemp = millis();
+      SD.begin(SD_CS);
+      totalSDbeginTemp = millis() - totalSDbeginTemp;
+      totalSDbegin += totalSDbeginTemp;
+
+      unsigned long totalSDreadTemp = millis();
+      imageFile.read(bufferTemp, HEIGHT);
+      totalSDreadTemp = millis() - totalSDreadTemp;
+      totalSDread += totalSDreadTemp;
+
+      unsigned long totalTFTtemp = millis();
+
+      tft.drawYBitmap(0, j * HEIGHT / 40, bufferTemp, 320, HEIGHT / 40, color);
+      totalTFTtemp = millis() - totalTFTtemp;
+      totalTFT += totalTFTtemp;
+    }
+  } else {
+    Serial.println("image not available");
+  }
+  //dataFile = SD.open(logFileName, FILE_WRITE);
+  Serial.print("SD Begin: ");
+  Serial.println(totalSDbegin);
+  Serial.print("SD Read: ");
+  Serial.println(totalSDread);
+  Serial.print("TFT Draw: ");
+  Serial.println(totalTFT);
+  Serial.println();
+  digitalWrite(ILI9341_LED_PIN, HIGH);
 }
 
 int gearLargeLast = 0;
@@ -161,51 +260,53 @@ int psiLast = -1;
 int fuelLevelLast = -1;
 int coolantTempLast = -1;
 int throttleLast = -1;
+int gearLast = -1;
+int timingLast = -1;
 
 void loop() {
-#ifndef GEAR_ONLY
   float psi = ecu_req(INTAKE_PRESSURE);
   psi = psi * 0.145038 - 14.0;
   if ((int) psi != psiLast) {
-    clearData(PSI_CLEAR);
-    drawData(PSI_DRAW, psi);
+    drawData(PSI_DRAW, psi, psiLast);
     psiLast = psi;
   }
 
   int rpm = ecu_req(ENGINE_RPM);
   if (rpm >= 0) {
-    drawRPM(rpm + rpmRes / 2);
+    //drawRPM(rpm + rpmRes / 2);
   }
 
   int kmh = ecu_req(VEHICLE_SPEED);
   int mph = kmh * 0.6214 + 0.5;
   if (mph >= 0 && mph != mphLast) {
-    clearData(MPH_CLEAR);
-    drawData(MPH_DRAW, mph);
+    drawData(MPH_DRAW, mph, mphLast);
     mphLast = mph;
   }
 
   float coolantTemp = ecu_req(ENGINE_COOLANT_TEMP);
   coolantTemp = coolantTemp * 9 / 5 + 32;
   if ((int) coolantTemp != coolantTempLast) {
-    clearData(COOL_CLEAR);
-    drawData(COOL_DRAW, coolantTemp);
+    drawData(COOL_DRAW, coolantTemp, coolantTempLast);
     coolantTempLast = coolantTemp;
   }
 
   int throttle = ecu_req(THROTTLE);
   if (throttle != throttleLast) {
-    clearData(THROTTLE_CLEAR);
-    drawData(THROTTLE_DRAW, throttle);
+    drawData(THROTTLE_DRAW, throttle, throttleLast);
     throttleLast = throttle;
   }
 
 
   float fuelLevel = ecu_req(FUEL_TANK_LEVEL);
   if ((int) fuelLevel != fuelLevelLast) {
-    clearData(FUEL_CLEAR);
-    drawData(FUEL_DRAW, fuelLevel);
+    drawData(FUEL_DRAW, fuelLevel, fuelLevelLast);
     fuelLevelLast = fuelLevel;
+  }
+
+  int timing = ecu_req(TIMING_ADVANCE);
+  if (timing != timingLast) {
+    drawData(TIMING_DRAW, timing, timingLast);
+    timingLast = timing;
   }
 
   float gearRatio = rpm / kmh;
@@ -220,11 +321,11 @@ void loop() {
   if (gear == 0 && gearCounter <= 2) {
     gearCounter ++;
   }
-  if (gearRatio != -1 && gearCounter > 2) {
+  if (gearRatio != -1 && gearCounter > 2 && gear != gearLast) {
     gearCounter = 0;
-    clearData(GEAR_CLEAR);
     if (gear != 0) {
-      drawData(GEAR_DRAW, gear);
+      drawData(GEAR_DRAW, gear, gearLast);
+      gearLast = gear;
     }
   }
   dataFile.print(millis());
@@ -242,117 +343,31 @@ void loop() {
   dataFile.print(fuelLevel);
   dataFile.print(",");
   dataFile.println(gear);
-#else
-  int kmh = ecu_req(VEHICLE_SPEED);
-  int rpm = ecu_req(ENGINE_RPM);
-  float gearRatio = rpm / kmh;
-  int gear = 0;
-  for (int i = 0; i < sizeof(rpmOverKmh) / sizeof(rpmOverKmh[0]); i ++) {
-    if (gearRatio / rpmOverKmh[i] < 1.15 && gearRatio / rpmOverKmh[i] > 0.85) {
-      gear = i + 1;
-      gearCounter = 3;
-      break;
-    }
-  }
-  if (gear == 0 && gearCounter <= 2) {
-    gearCounter ++;
-  }
-  if (gearRatio != -1 && gearCounter > 2) {
-    gearCounter = 0;
-
-    if (gear != 0) {
-      if (rpm < 2000) {
-        if (gearLargeColorLast != 0 || gearLargeLast != gear) {
-          gearLargeColorLast = 0;
-          gearLargeLast = gear;
-          drawDataLarge(GEAR_LARGE_BLUE_DRAW, gear, 0);
-        }
-      } else if (rpm < 3000) {
-        if (gearLargeColorLast != 1 || gearLargeLast != gear) {
-          gearLargeColorLast = 1;
-          gearLargeLast = gear;
-          gearLargeColorLast = 1;
-          drawDataLarge(GEAR_LARGE_GREEN_DRAW, gear, 1);
-        }
-      } else if (rpm < 4000) {
-        if (gearLargeColorLast != 2 || gearLargeLast != gear) {
-          gearLargeColorLast = 2;
-          gearLargeLast = gear;
-          drawDataLarge(GEAR_LARGE_YELLOW_DRAW, gear, 2);
-        }
-      } else {
-        if (gearLargeColorLast != 3 || gearLargeLast != gear) {
-          gearLargeColorLast = 3;
-          gearLargeLast = gear;
-          gearLargeColorLast = 3;
-          drawDataLarge(GEAR_LARGE_RED_DRAW, gear, 3);
-        }
-      }
-    }
-#endif
+  dataFile.flush();
 }
 
-void drawLabels() {
-  tft.fillRect(0, 0, 320, 240, ILI9341_BLACK);
-  tft.setFont(&FreeSansBold12pt7b);
-  tft.setTextColor(ILI9341_WHITE);
-  //tft.setTextSize(1);
-  tft.setCursor(30, 230);
-  tft.print("MPH");
-  tft.setCursor(125, 230);
-  tft.print("GEAR");
-  tft.setCursor(240, 230);
-  tft.print("PSI");
-  tft.setCursor(225, 160);
-  tft.print("FUEL");
-  tft.setCursor(125, 160);
-  tft.print("COOL");
-  tft.setCursor(30, 160);
-  tft.print("TB%");
+void drawData(int * rect, int data, int dataLast) {
+  putData(rect, dataLast, 0);
+  putData(rect, data, 1);
 }
 
-void clearData(int * rect) {
-  tft.fillRect(rect[0], rect[1], rect[2], rect[3], ILI9341_BLACK);
-}
-
-#ifdef GEAR_ONLY
-void drawDataLarge(int * rect, int data, int color) {
-  clearData(GEAR_LARGE_CLEAR);
-  tft.setFont(&FreeSansBold24pt7b);
-  tft.setTextSize(5);
-  tft.setRotation(3);
-  tft.setCursor(rect[0], rect[1]);
-  switch (color) {
-    case 0:
-      tft.setTextColor(ILI9341_BLUE);
-      break;
-    case 1:
-      tft.setTextColor(ILI9341_GREEN);
-      break;
-    case 2:
-      tft.setTextColor(ILI9341_YELLOW);
-      break;
-    case 3:
-      tft.setTextColor(ILI9341_RED);
-      break;
-  }
-  tft.print(String(data));
-}
-#endif
-
-void drawData(int * rect, int data) {
+void putData(int * rect, int data, char color) {
   int charOffset;
-  if (data < 10) //single digit
+  if (abs(data) < 10) //single digit
     charOffset = 40;
-  if (data >= 10) //double digit
+  if (abs(data) >= 10) //double digit
     charOffset = 35;
-  if (data >= 100) //triple digit
+  if (abs(data) >= 100) //triple digit
     charOffset = 30;
   tft.setFont(&FreeSansBold12pt7b);
   tft.setTextSize(1);
   tft.setRotation(3);
   tft.setCursor(rect[0] + charOffset, rect[1]);
-  tft.setTextColor(ILI9341_WHITE);
+  if (color == 0) {
+    tft.setTextColor(ILI9341_BLACK);
+  } else {
+    tft.setTextColor(ILI9341_WHITE);
+  }
   tft.print(String(data));
 }
 
@@ -368,11 +383,10 @@ void drawSweep() {
 }
 
 void initTFTDraw() {
-  tft.setRotation(3);
-  tft.fillScreen(bootColor);
+  //tft.fillScreen(bootColor);
 #ifndef GEAR_ONLY
-  drawLabels();
-  drawSweep();
+  //drawLabels();
+  //drawSweep();
 #endif
   digitalWrite(ILI9341_LED_PIN, HIGH);
 }
@@ -440,12 +454,17 @@ float ecu_req(unsigned char pid) {
   unsigned char tmp[8] = {0x02, 0x01, pid, 0, 0, 0, 0, 0};
   CAN.sendMsgBuf(CAN_ID_PID, 0, 8, tmp);
   int timeout = 0;
-  while (digitalRead(MCP_INT) && timeout < 50) {
+  while (digitalRead(MCP_INT) && timeout < 100) {
     timeout ++;
-    if (timeout < 50) {
-      Serial.print(".");
+    if (timeout < 100) {
+      //Serial.print(".");
     } else {
-      Serial.println(".");
+      //Serial.println(".");
+      //Serial.println();
+      //Serial.println("Entering Sleep");
+      //delay(10);
+      //enterSleep();
+      //return;
     }
     delay(1);
   }
@@ -510,4 +529,5 @@ void initTFT() {
   delay(1);
   FastPin<ILI9341_RST_PIN>::hi();
   tft.begin();
+  tft.setRotation(3);
 }
